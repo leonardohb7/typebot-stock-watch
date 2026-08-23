@@ -12,9 +12,9 @@ concurrency:
   group: watch
   cancel-in-progress: false
 
-# So leitura: o estado vive no cache, nada e commitado.
+# O catalogo vive no cache, nunca no git. O write abaixo e so pro keepalive.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   check:
@@ -62,3 +62,7 @@ jobs:
         with:
           path: estado.json
           key: estado-${{ github.run_id }}
+
+            # Um commit vazio a cada ~50 dias zera o contador. Nao publica conteudo.
+      - name: Manter o agendamento vivo
+        run: test $(( ($(date +%s) - $(git log -1 --format=%ct)) / 86400 )) -ge 50 && git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit --allow-empty -m keepalive && git push || true
