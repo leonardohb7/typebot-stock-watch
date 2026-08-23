@@ -1,0 +1,10 @@
+# Configuracao local: tem o identificador do fluxo. Nunca versionar.
+config.ini
+
+# O estado guarda o catalogo capturado. Fica no cache do CI, fora do git.
+estado.json
+estado.prev
+
+__pycache__/
+*.pyc
+.env

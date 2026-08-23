@@ -1,0 +1,17 @@
+# Copie para config.ini e preencha. Variaveis de ambiente WATCH_* tem prioridade.
+
+[watch]
+base = https://host.do.typebot
+flow = nome-do-fluxo
+id = identificador-que-o-fluxo-pede
+topico = troque-por-um-nome-sorteado
+entrada = regex-da-opcao-de-entrada
+
+# Uma secao por linha, no formato ROTULO=regex.
+secoes =
+  PRIMEIRA=regex
+  SEGUNDA=regex
+
+# Intervalo entre verificacoes no modo --loop, em minutos (sorteado a cada ciclo).
+intervalo_min = 7
+intervalo_max = 12

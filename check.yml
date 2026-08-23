@@ -1,0 +1,64 @@
+name: check
+
+on:
+  schedule:
+    # A cada 10 min; o jitter abaixo sorteia ate 2m30s, entao os intervalos
+    # reais ficam entre ~7 e ~12 minutos. O cron do Actions e best-effort:
+    # sob carga o GitHub atrasa, as vezes bastante.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+# So leitura: o estado vive no cache, nada e commitado.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # O estado da rodada anterior vem do cache, nunca do repositorio.
+      - name: Restaurar estado
+        uses: actions/cache/restore@v4
+        with:
+          path: estado.json
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+
+      - name: Jitter
+        run: sleep $((RANDOM % 150))
+
+      - name: Rodar
+        env:
+          WATCH_BASE: ${{ secrets.WATCH_BASE }}
+          WATCH_FLOW: ${{ secrets.WATCH_FLOW }}
+          WATCH_ID: ${{ secrets.WATCH_ID }}
+          WATCH_TOPIC: ${{ secrets.WATCH_TOPIC }}
+          WATCH_ENTRY: ${{ secrets.WATCH_ENTRY }}
+          WATCH_SECTIONS: ${{ secrets.WATCH_SECTIONS }}
+          WATCH_MENU: ${{ secrets.WATCH_MENU }}
+        run: |
+          cp -f estado.json estado.prev 2>/dev/null || true
+          python3 bot.py
+
+      - name: Mudou?
+        id: diff
+        run: |
+          if cmp -s estado.json estado.prev; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Grava uma entrada nova so quando o catalogo muda.
+      - name: Salvar estado
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: estado.json
+          key: estado-${{ github.run_id }}
