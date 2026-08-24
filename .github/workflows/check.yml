@@ -2,9 +2,9 @@ name: check
 
 on:
   schedule:
-    # A cada 10 min; o jitter abaixo sorteia ate 2m30s, entao os intervalos
-    # reais ficam entre ~7 e ~12 minutos. O cron do Actions e best-effort:
-    # sob carga o GitHub atrasa, as vezes bastante.
+    # O cron do Actions e best-effort e atrasa muito: medido neste repo, dispara
+    # a cada 40-70 min, nao a cada 10. Por isso cada execucao roda o bot em laco
+    # por 50 min, verificando a cada 7-12 min -- igual ao modo local do projeto.
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
@@ -44,7 +44,7 @@ jobs:
           WATCH_MENU: ${{ secrets.WATCH_MENU }}
         run: |
           cp -f estado.json estado.prev 2>/dev/null || true
-          python3 bot.py
+          timeout 3000 python3 bot.py --loop || true
 
       - name: Mudou?
         id: diff
