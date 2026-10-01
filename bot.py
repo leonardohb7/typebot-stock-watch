@@ -218,16 +218,25 @@ GO_ON = re.compile(r"ciente|entendi|continuar|prosseguir|ok", re.I)
 
 
 def parse_sections(raw):
-    """Le WATCH_SECTIONS: uma linha por secao, no formato ROTULO=regex."""
+    """Le WATCH_SECTIONS. Uma linha por secao: ROTULO=regex[@intervalo_min].
+
+    O intervalo e opcional e diz de quantos em quantos minutos aquela secao
+    deve ser visitada. 0 ou ausente = toda rodada.
+    """
     out = []
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        label, sep, pattern = line.partition("=")
+        label, sep, resto = line.partition("=")
         if not sep:
-            label, pattern = label, label
-        out.append((label.strip().upper(), pattern.strip()))
+            resto = label
+        pattern, arroba, cada = resto.partition("@")
+        try:
+            cada = int(cada) if arroba else 0
+        except ValueError:
+            cada = 0
+        out.append((label.strip().upper(), pattern.strip(), max(0, cada)))
     return out
 
 
@@ -235,7 +244,7 @@ def menu_hint(sections):
     """Regex que reconhece o menu principal. Padrao: a uniao das secoes."""
     raw = os.environ.get("WATCH_MENU", "").strip()
     if not raw:
-        raw = "|".join("(?:%s)" % p for _, p in sections)
+        raw = "|".join("(?:%s)" % p for _, p, _ in sections)
     return re.compile(raw or ".", re.I)
 
 
@@ -249,46 +258,73 @@ def reach_menu(chat, hint, max_hops=5):
         if len(chat.items) == 1:  # tela de "ok" com nome diferente
             chat.send(chat.items[0])
             continue
-        raise FlowError("nao cheguei no menu — opcoes: %r" % (chat.items,))
+        raise FlowError("nao cheguei no menu - opcoes: %r" % (chat.items,))
     raise FlowError("nao cheguei no menu depois de %d telas" % max_hops)
 
 
-def collect(ident, entry, sections):
-    """Percorre o fluxo e devolve o relatorio em texto."""
+def ate_o_menu(cfg, hint):
+    """Abre uma sessao nova e navega ate o menu principal."""
     chat = Chat()
-    out = []
-
-    chat.pick(entry)
-
+    chat.pick(cfg["entry"])
     if chat.input_type != "text input":
         raise FlowError("esperava campo de texto, veio %r" % (chat.input_type,))
-    chat.send(ident)
+    chat.send(cfg["ident"])
+    reach_menu(chat, hint)
+    return chat
 
-    reach_menu(chat, menu_hint(sections))
-    out.append(("MENU", "", chat.items))
 
-    for pos, (label, pattern) in enumerate(sections):
-        # A primeira secao tem que estar no menu. As seguintes costumam ficar
-        # penduradas no ramo anterior, entao so entra se a opcao aparecer.
-        if pos and not any(re.search(pattern, i, re.I) for i in chat.items):
+def collect(cfg, devidas):
+    """Visita as secoes devidas.
+
+    O fluxo e um funil de mao unica: depois de entrar numa categoria nao ha
+    como voltar ao menu. Por isso cada folha (categoria, composto) precisa de
+    uma sessao propria. A primeira folha de cada categoria reaproveita a
+    sessao que ja esta aberta.
+
+    Devolve (opcoes do menu, {rotulo da folha: (texto, opcoes)}).
+    """
+    hint = menu_hint(cfg["sections"])
+    menu = None
+    capturas = {}
+
+    for label, pattern, _ in devidas:
+        chat = ate_o_menu(cfg, hint)
+        if menu is None:
+            menu = list(chat.items)
+
+        chat.pick(pattern)
+        compostos = list(chat.items)
+
+        if not compostos:
+            # categoria sem passo de composto: ja e a tela final
+            capturas[label] = (chat.text, [])
             continue
-        if chat.pick(pattern, required=not pos) is None:
-            continue
-        out.append((label, chat.text, chat.items))
-        if not pos:
-            chat.pick(r"voltar|in[íi]cio", required=False)
 
-    return render(out)
+        for i, composto in enumerate(compostos):
+            atual = chat
+            if i:
+                atual = ate_o_menu(cfg, hint)
+                atual.pick(pattern)
+            atual.send(composto)
+            capturas["%s / %s" % (label, composto)] = (atual.text, list(atual.items))
+
+    return menu, capturas
 
 
-def render(sections):
+def render(menu, secoes):
+    """Monta o relatorio inteiro a partir do estado acumulado."""
     out = []
-    for title, text, options in sections:
-        out.append("== %s ==" % title)
-        if text:
-            out.append(text)
-        if options:
-            out.append("opcoes: " + " | ".join(options))
+    if menu:
+        out.append("== MENU ==")
+        out.append("opcoes: " + " | ".join(menu))
+        out.append("")
+    for rotulo in sorted(secoes):
+        dados = secoes[rotulo]
+        out.append("== %s ==" % rotulo)
+        if dados.get("texto"):
+            out.append(dados["texto"])
+        if dados.get("opcoes"):
+            out.append("opcoes: " + " | ".join(dados["opcoes"]))
         out.append("")
     return tidy("\n".join(out))
 
@@ -301,7 +337,7 @@ def load_config(path):
     parser = configparser.ConfigParser()
     try:
         parser.read(path, encoding="utf-8")
-    except (OSError, configparser.Error):
+    except configparser.Error:
         return {}
     if not parser.has_section("watch"):
         return {}
@@ -311,15 +347,24 @@ def load_config(path):
 def load_state(path):
     try:
         with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
+            estado = json.load(fh)
     except (OSError, ValueError):
-        return {}
+        return {"menu": [], "secoes": {}}
+    if not isinstance(estado, dict):
+        return {"menu": [], "secoes": {}}
+    estado.setdefault("menu", [])
+    estado.setdefault("secoes", {})
+    return estado
 
 
-def save_state(path, report):
+def save_state(path, estado):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(
-            {"report": report, "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
+            {
+                "menu": estado.get("menu", []),
+                "secoes": estado.get("secoes", {}),
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            },
             fh,
             ensure_ascii=False,
             indent=1,
@@ -334,6 +379,26 @@ def added_lines(old, new):
         for ln in diff
         if ln.startswith("+") and not ln.startswith("+++") and ln[1:].strip()
     ]
+
+
+def categoria(rotulo):
+    """'FLORES / THC' -> 'FLORES'."""
+    return rotulo.split(" / ")[0]
+
+
+def secoes_devidas(sections, secoes, agora):
+    """Quais secoes tocam nesta rodada, segundo o intervalo de cada uma."""
+    devidas = []
+    for label, pattern, cada in sections:
+        if cada <= 0:
+            devidas.append((label, pattern, cada))
+            continue
+        vistos = [
+            v.get("visto", 0) for k, v in secoes.items() if categoria(k) == label
+        ]
+        if not vistos or (agora - max(vistos)) >= cada * 60:
+            devidas.append((label, pattern, cada))
+    return devidas
 
 
 # ------------------------------------------------------------ notificacao
@@ -367,11 +432,20 @@ def notify(topic, title, message, tags):
 def ciclo(cfg, state_path, avisou_quebra):
     """Um ciclo completo. Devolve o novo valor de avisou_quebra."""
     topic = cfg["topic"]
+    estado = load_state(state_path)
+    secoes = dict(estado.get("secoes") or {})
+    agora = time.time()
+
+    devidas = secoes_devidas(cfg["sections"], secoes, agora)
+    if not devidas:
+        print("%s  nenhuma secao devida" % time.strftime("%H:%M"))
+        return avisou_quebra
+
     try:
-        report = collect(cfg["ident"], cfg["entry"], cfg["sections"])
+        menu, capturas = collect(cfg, devidas)
     except FlowError as exc:
         print("FALHA: %s" % exc, file=sys.stderr)
-        # So avisa na primeira falha da sequencia: senao vira spam a cada 9 min.
+        # So avisa na primeira falha da sequencia: senao vira spam a cada ciclo.
         if topic and not avisou_quebra:
             notify(
                 topic,
@@ -386,26 +460,36 @@ def ciclo(cfg, state_path, avisou_quebra):
         if topic:
             notify(topic, "flow-watch voltou", "Navegacao normalizada.", ["white_check_mark"])
 
-    state = load_state(state_path)
-    previous = state.get("report", "")
+    anterior = render(estado.get("menu") or [], estado.get("secoes") or {})
 
-    if report == previous:
-        print("%s  sem mudancas" % time.strftime("%H:%M"))
+    # As folhas das categorias visitadas sao substituidas por inteiro: um
+    # composto pode ter deixado de existir na receita.
+    visitadas = {l for l, _, _ in devidas}
+    secoes = {k: v for k, v in secoes.items() if categoria(k) not in visitadas}
+    for rotulo, (texto, opcoes) in capturas.items():
+        secoes[rotulo] = {"texto": texto, "opcoes": opcoes, "visto": agora}
+
+    novo_menu = menu or estado.get("menu") or []
+    report = render(novo_menu, secoes)
+
+    if report == anterior:
+        print("%s  sem mudancas (%s)" % (time.strftime("%H:%M"), ", ".join(sorted(visitadas))))
+        save_state(state_path, {"menu": novo_menu, "secoes": secoes})
         return False
 
-    if not previous:
+    if not anterior:
         title = "flow-watch ativo"
         body = "Primeira execucao. Catalogo atual:\n\n%s" % report
         tags = ["seedling"]
     else:
-        novos = added_lines(previous, report)
+        novos = added_lines(anterior, report)
         destaque = "Novidades:\n" + "\n".join(novos) + "\n\n" if novos else ""
         title = "Catalogo mudou"
         body = "%s%s" % (destaque, report)
         tags = ["bell"]
 
     notify(topic, title, body, tags)
-    save_state(state_path, report)
+    save_state(state_path, {"menu": novo_menu, "secoes": secoes})
     print("%s  mudanca detectada, notificacao enviada" % time.strftime("%H:%M"))
     return False
 
@@ -471,7 +555,8 @@ def main():
 
     if args.dry_run:
         try:
-            print(collect(cfg["ident"], cfg["entry"], cfg["sections"]))
+            menu, capturas = collect(cfg, cfg["sections"])
+            print(render(menu, {k: {"texto": t, "opcoes": o} for k, (t, o) in capturas.items()}))
         except FlowError as exc:
             sys.exit("FALHA: %s" % exc)
         return
