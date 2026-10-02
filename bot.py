@@ -372,6 +372,107 @@ def save_state(path, estado):
         fh.write("\n")
 
 
+ITEM = re.compile(r"^\[\s*R\$\s*([\d.,]+)\s*\]\s*[\u2014\u2013-]?\s*(.*)$")
+
+
+def item(opcao):
+    """'[R$ 90] - Forbidden (indoor)' -> (90.0, 'Forbidden (indoor)').
+
+    Opcao que nao parece produto volta como (None, texto cru).
+    """
+    m = ITEM.match((opcao or "").strip())
+    if not m:
+        return (None, (opcao or "").strip())
+    bruto = m.group(1).replace(".", "").replace(",", ".")
+    nome = re.sub(r"\s*\(\s*R\$[^)]*\)\s*$", "", m.group(2)).strip()
+    try:
+        return (float(bruto), nome)
+    except ValueError:
+        return (None, nome)
+
+
+def preco(valor):
+    if valor is None:
+        return ""
+    return "R$ %d" % valor if float(valor).is_integer() else "R$ %.2f" % valor
+
+
+def linha(opcao):
+    p, nome = item(opcao)
+    return "%s  %s" % (preco(p), nome) if p is not None else nome
+
+
+def por_nome(opcoes):
+    return {item(o)[1]: (item(o)[0], o) for o in (opcoes or [])}
+
+
+def resumo(antes, agora):
+    """Compara dois {rotulo: [opcoes]}. Devolve (chegou, saiu, mudou_preco)."""
+    chegou, saiu, mudou = {}, {}, {}
+    for rotulo in sorted(set(antes) | set(agora)):
+        a = por_nome(antes.get(rotulo))
+        b = por_nome(agora.get(rotulo))
+        for nome in sorted(b):
+            if nome not in a:
+                chegou.setdefault(rotulo, []).append(b[nome][1])
+            elif a[nome][0] != b[nome][0]:
+                mudou.setdefault(rotulo, []).append((nome, a[nome][0], b[nome][0]))
+        for nome in sorted(a):
+            if nome not in b:
+                saiu.setdefault(rotulo, []).append(a[nome][1])
+    return chegou, saiu, mudou
+
+
+def catalogo(secoes):
+    """So os produtos, agrupados por secao e ordenados por preco."""
+    out = []
+    for rotulo in sorted(secoes):
+        itens = secoes[rotulo].get("opcoes") or []
+        out.append(rotulo)
+        if not itens:
+            out.append("  (nada disponivel)")
+        for o in sorted(itens, key=lambda x: (item(x)[0] is None, item(x)[0] or 0, item(x)[1])):
+            out.append("  " + linha(o))
+        out.append("")
+    return "\n".join(out).strip()
+
+
+def titulo_mudanca(chegou, saiu, mudou):
+    n = lambda d: sum(len(v) for v in d.values())
+    partes = []
+    if n(chegou):
+        partes.append("%d novo%s" % (n(chegou), "s" if n(chegou) > 1 else ""))
+    if n(saiu):
+        partes.append("%d saiu" % n(saiu) if n(saiu) == 1 else "%d sairam" % n(saiu))
+    if n(mudou):
+        partes.append("%d de preco" % n(mudou))
+    return ", ".join(partes) if partes else "catalogo mudou"
+
+
+def corpo_mudanca(chegou, saiu, mudou, secoes):
+    blocos = []
+    if chegou:
+        linhas = ["CHEGOU"]
+        for rotulo in sorted(chegou):
+            for o in chegou[rotulo]:
+                linhas.append("  %s  |  %s" % (linha(o), rotulo))
+        blocos.append("\n".join(linhas))
+    if saiu:
+        linhas = ["SAIU"]
+        for rotulo in sorted(saiu):
+            for o in saiu[rotulo]:
+                linhas.append("  %s  |  %s" % (linha(o), rotulo))
+        blocos.append("\n".join(linhas))
+    if mudou:
+        linhas = ["MUDOU DE PRECO"]
+        for rotulo in sorted(mudou):
+            for nome, antes_p, agora_p in mudou[rotulo]:
+                linhas.append("  %s: %s -> %s  |  %s" % (nome, preco(antes_p), preco(agora_p), rotulo))
+        blocos.append("\n".join(linhas))
+    blocos.append("CATALOGO ATUAL\n" + catalogo(secoes))
+    return "\n\n".join(blocos)
+
+
 def added_lines(old, new):
     diff = difflib.unified_diff(old.splitlines(), new.splitlines(), n=0, lineterm="")
     return [
@@ -460,7 +561,9 @@ def ciclo(cfg, state_path, avisou_quebra):
         if topic:
             notify(topic, "flow-watch voltou", "Navegacao normalizada.", ["white_check_mark"])
 
-    anterior = render(estado.get("menu") or [], estado.get("secoes") or {})
+    anterior = {
+        k: (v.get("opcoes") or []) for k, v in (estado.get("secoes") or {}).items()
+    }
 
     # As folhas das categorias visitadas sao substituidas por inteiro: um
     # composto pode ter deixado de existir na receita.
@@ -470,22 +573,24 @@ def ciclo(cfg, state_path, avisou_quebra):
         secoes[rotulo] = {"texto": texto, "opcoes": opcoes, "visto": agora}
 
     novo_menu = menu or estado.get("menu") or []
-    report = render(novo_menu, secoes)
+    atual = {k: (v.get("opcoes") or []) for k, v in secoes.items()}
 
-    if report == anterior:
+    # A comparacao olha so os produtos. Mudanca no texto das telas nao
+    # notifica: e so moldura, e era o que enchia o aviso de ruido.
+    chegou, saiu, mudou = resumo(anterior, atual)
+
+    if anterior and not (chegou or saiu or mudou):
         print("%s  sem mudancas (%s)" % (time.strftime("%H:%M"), ", ".join(sorted(visitadas))))
         save_state(state_path, {"menu": novo_menu, "secoes": secoes})
         return False
 
     if not anterior:
         title = "flow-watch ativo"
-        body = "Primeira execucao. Catalogo atual:\n\n%s" % report
+        body = "Primeira leitura do catalogo.\n\n" + catalogo(secoes)
         tags = ["seedling"]
     else:
-        novos = added_lines(anterior, report)
-        destaque = "Novidades:\n" + "\n".join(novos) + "\n\n" if novos else ""
-        title = "Catalogo mudou"
-        body = "%s%s" % (destaque, report)
+        title = titulo_mudanca(chegou, saiu, mudou)
+        body = corpo_mudanca(chegou, saiu, mudou, secoes)
         tags = ["bell"]
 
     notify(topic, title, body, tags)
